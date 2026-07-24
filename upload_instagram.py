@@ -1,156 +1,158 @@
 """
-Instagram Reels Upload - Using temp hosting services for Public URL
-Uploads video via fallback chain of free hosts, then uses URL for Instagram API
+Robust Instagram Reel & Story Uploader via Meta Graph API v21.0
+Supports container creation, status checking, and media publishing.
 """
+import os, sys, time, json, requests, pathlib, subprocess, base64
 
-import os
-import sys
-import requests
-import time
-from pathlib import Path
+def mask(s):
+    return f"{s[:10]}...{s[-4:]}" if s and len(s) > 10 else "MISSING"
 
-if sys.platform == 'win32':
-    import codecs
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+def upload_video_to_github(video_path_obj):
+    repo_full = os.getenv('GITHUB_REPOSITORY')
+    if not repo_full:
+        raise ValueError("GITHUB_REPOSITORY env var missing")
+    owner, repo = repo_full.split('/')
+    token = os.getenv('GITHUB_TOKEN')
+    
+    with open(video_path_obj, 'rb') as f:
+        file_bytes = f.read()
+    
+    file_b64 = base64.b64encode(file_bytes).decode('ascii')
+    filename = f"temp_ig_{video_path_obj.stem}_{int(time.time())}.mp4"
+    remote_path = f"output/{filename}"
+    branch = "main"
+    
+    h = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{remote_path}"
+    
+    put_r = requests.put(url, headers=h, json={
+        'message': f'Temp IG upload {filename}',
+        'content': file_b64,
+        'branch': branch
+    }, timeout=60)
+    
+    if put_r.status_code not in (200, 201):
+        raise Exception(f"GitHub temp upload failed ({put_r.status_code}): {put_r.text[:300]}")
+    
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{remote_path}"
+    return raw_url, owner, repo, token, remote_path, branch
 
-REQ_TIMEOUT = (15, 120)
+def delete_github_temp_file(owner, repo, token, remote_path, branch):
+    try:
+        h = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{remote_path}"
+        g_r = requests.get(url, headers=h, params={'ref': branch}, timeout=10)
+        if g_r.status_code == 200:
+            sha = g_r.json()['sha']
+            requests.delete(url, headers=h, json={'message': 'Cleanup temp IG file', 'sha': sha, 'branch': branch}, timeout=10)
+    except Exception:
+        pass
 
-
-    for name, upload_func in HOSTING_SERVICES:
-        try:
-            print(f"[instagram] Trying {name}...")
-            url = upload_func(file_path)
-            print(f"[instagram] Uploaded via {name}: {url}")
-            return url
-        except Exception as e:
-            print(f"[instagram] {name} failed: {e}")
-            last_error = e
-            continue
-    raise Exception(f"All hosting services failed. Last error: {last_error}")
-
-
-def upload_to_instagram(video_path, caption):
+def upload_to_instagram(video_path, caption="", is_story=False):
+    media_type = 'STORIES' if is_story else 'REELS'
     print("\n" + "=" * 60)
-    print("📸 INSTAGRAM UPLOAD STARTING")
+    print(f"INSTAGRAM {media_type} UPLOAD (Graph API v21.0)")
     print("=" * 60)
 
-    access_token = os.getenv('IG_ACCESS_TOKEN')
-    user_id = os.getenv('IG_USER_ID')
+    access_token = (os.getenv('INSTAGRAM_ACCESS_TOKEN') or 
+                    os.getenv('IG_ACCESS_TOKEN') or 
+                    os.getenv('FACEBOOK_ACCESS_TOKEN') or 
+                    os.getenv('FB_ACCESS_TOKEN'))
+    
+    user_id = (os.getenv('INSTAGRAM_ACCOUNT_ID') or 
+               os.getenv('IG_USER_ID'))
 
     if not access_token:
-        print("[instagram] Skipping - IG_ACCESS_TOKEN not set")
-        return {'status': 'skipped', 'reason': 'Missing credentials', 'platform': 'instagram'}
+        print("[instagram] ⚠️ Skipping - missing access token")
+        return {'status': 'skipped', 'reason': 'Missing access token', 'platform': 'instagram'}
+
+    fb_page_id = os.getenv('FACEBOOK_PAGE_ID') or os.getenv('FB_PAGE_ID')
+    if not user_id and fb_page_id:
+        try:
+            print(f"[instagram] User ID missing - querying Meta Graph API for Page {fb_page_id}...")
+            ig_r = requests.get(
+                f"https://graph.facebook.com/v21.0/{fb_page_id}?fields=instagram_business_account&access_token={access_token}",
+                timeout=15
+            )
+            if ig_r.status_code == 200:
+                acct = ig_r.json().get('instagram_business_account')
+                if acct and acct.get('id'):
+                    user_id = acct['id']
+                    print(f"[instagram] Found Instagram Business Account ID: {user_id}")
+        except Exception as e:
+            print(f"[instagram] IG ID lookup error: {e}")
 
     if not user_id:
-        print("[instagram] Skipping - IG_USER_ID not set")
-        return {'status': 'skipped', 'reason': 'Missing credentials', 'platform': 'instagram'}
+        print("[instagram] ⚠️ Skipping - no Instagram Business Account connected to this Page")
+        return {'status': 'skipped', 'reason': 'No Instagram Business Account', 'platform': 'instagram'}
 
-    print("[instagram] Credentials loaded")
-    print(f"[instagram] User ID: {user_id}")
+    print(f"[instagram] Account ID: {user_id}")
+    print(f"[instagram] Access Token: {mask(access_token)}")
 
-    video_path_obj = Path(video_path)
+    video_path_obj = pathlib.Path(video_path)
     if not video_path_obj.exists():
-        raise FileNotFoundError(f"Video not found: {video_path}")
+        print(f"[instagram] ❌ Video file not found: {video_path}")
+        return {'status': 'failed', 'error': 'Video file not found', 'platform': 'instagram'}
 
-    file_size_mb = video_path_obj.stat().st_size / (1024 * 1024)
-    print(f"[instagram] Video file: {video_path} ({file_size_mb:.2f} MB)")
-
-    caption_limited = caption[:2200] if len(caption) > 2200 else caption
-    print(f"[instagram] Caption length: {len(caption_limited)} characters")
+    print("[instagram] Step 1: Generating public video URL via GitHub Raw...")
+    raw_url, owner, repo, gh_token, remote_path, branch = upload_video_to_github(video_path_obj)
+    print(f"[instagram] Video URL: {raw_url}")
 
     try:
-        print("[instagram] Step 1: Uploading to GitHub raw URL...")
-        import subprocess as _sp, uuid as _uuid, os as _os
-        _vid_name = "ig_" + _uuid.uuid4().hex[:8] + ".mp4"
-        _os.system("cp " + str(video_path) + " " + _vid_name)
-        _os.system("git config --global user.email bot@bot.com")
-        _os.system("git config --global user.name Bot")
-        _os.system("git add -f " + _vid_name)
-        _os.system("git commit -m \"add " + _vid_name + "\"")
-        for _ in range(3):
-            _ret = _os.system("git push origin main")
-            if _ret == 0:
-                break
-            time.sleep(5)
-        video_url = "https://raw.githubusercontent.com/" + thriveruswave + "/" + thrswv2 + "/main/" + _vid_name
-        print("[instagram] GitHub raw URL: " + video_url)
-        container_url = f"https://graph.facebook.com/v21.0/{user_id}/media"
-        container_params = {
-            'media_type': 'REELS',
-            'video_url': video_url,
-            'caption': caption_limited,
-            'share_to_feed': 'false',
-            'thumb_offset': '5000',
+        print(f"[instagram] Step 2: Creating {media_type} container on Meta Graph API...")
+        api_base = "https://graph.facebook.com/v21.0"
+        params = {
+            'media_type': 'STORIES' if is_story else 'REELS',
+            'video_url': raw_url,
+            'caption': caption[:2200] if caption else '',
             'access_token': access_token
         }
+        if not is_story:
+            params['share_to_feed'] = False
 
-        container_response = requests.post(container_url, params=container_params, timeout=60)
+        c_res = requests.post(f"{api_base}/{user_id}/media", params=params, timeout=60)
+        if c_res.status_code not in (200, 201):
+            err = c_res.json().get('error', {}).get('message', c_res.text)
+            raise Exception(f"Container creation failed: {err}")
 
-        if container_response.status_code != 200:
-            error_data = container_response.json() if container_response.text else {}
-            error_msg = error_data.get('error', {}).get('message', 'Unknown error')
-            print(f"[instagram] Container creation failed: {error_msg}")
+        container_id = c_res.json().get('id')
+        print(f"[instagram] ✅ Container Created: {container_id}")
 
-            print("[instagram] Retrying with Instagram Graph API endpoint...")
-            container_url = f"https://graph.instagram.com/v21.0/{user_id}/media"
-            container_response = requests.post(container_url, params=container_params, timeout=60)
+        print("[instagram] Step 3: Waiting for video container processing...")
+        time.sleep(15)
 
-            if container_response.status_code != 200:
-                raise Exception(f"Container Error: {error_msg}")
+        print("[instagram] Step 4: Publishing Reel...")
+        pub_res = requests.post(
+            f"{api_base}/{user_id}/media_publish",
+            params={'creation_id': container_id, 'access_token': access_token},
+            timeout=60
+        )
 
-        container_id = container_response.json().get('id')
-        print(f"[instagram] Container created: {container_id}")
-
-        print("[instagram] Step 3: Waiting 60 seconds for processing...")
-        time.sleep(60)
-
-        # Step 4: Publish
-        print("[instagram] Step 4: Publishing...")
-        publish_url = f"https://graph.facebook.com/v21.0/{user_id}/media_publish"
-        publish_params = {
-            "creation_id": container_id,
-            "access_token": access_token
-        }
-        publish_response = requests.post(publish_url, params=publish_params, timeout=60)
-
-        if publish_response.status_code != 200:
-            print("[instagram] First publish failed, retrying after 30s...")
-            time.sleep(30)
-            publish_response = requests.post(publish_url, params=publish_params, timeout=60)
-
-        if publish_response.status_code != 200:
-            error_data = publish_response.json() if publish_response and publish_response.text else {}
-            error_msg = error_data.get("error", {}).get("message", "Unknown error")
-            print(f"[instagram] Publish failed: {error_msg}")
-            raise Exception(f"Instagram Publish Error: {error_msg}")
-
-        media_id = publish_response.json().get("id")
-
-        print("[instagram] SUCCESS! Video published to Instagram!")
-        print(f"[instagram] Media ID: {media_id}")
-        print("=" * 60)
-
-        return {
-            'id': media_id,
-            'platform': 'instagram',
-            'status': 'success'
-        }
+        if pub_res.status_code in (200, 201):
+            media_id = pub_res.json().get('id', container_id)
+            print(f"[instagram] ✅ SUCCESS! Media ID: {media_id}")
+            print(f"INSTAGRAM: SUCCESS (ID: {media_id})")
+            delete_github_temp_file(owner, repo, gh_token, remote_path, branch)
+            return {'status': 'success', 'id': media_id, 'platform': 'instagram'}
+        else:
+            print(f"[instagram] Publish pending - retrying in 15s...")
+            time.sleep(15)
+            pub_res2 = requests.post(
+                f"{api_base}/{user_id}/media_publish",
+                params={'creation_id': container_id, 'access_token': access_token},
+                timeout=60
+            )
+            if pub_res2.status_code in (200, 201):
+                media_id = pub_res2.json().get('id', container_id)
+                print(f"[instagram] ✅ SUCCESS! Media ID: {media_id}")
+                print(f"INSTAGRAM: SUCCESS (ID: {media_id})")
+                delete_github_temp_file(owner, repo, gh_token, remote_path, branch)
+                return {'status': 'success', 'id': media_id, 'platform': 'instagram'}
+            else:
+                err = pub_res2.json().get('error', {}).get('message', pub_res2.text)
+                raise Exception(f"Publish failed: {err}")
 
     except Exception as e:
-        print("[instagram] ERROR!")
-        print(f"[instagram] {str(e)}")
-        print("=" * 60)
-        raise
-
-
-if __name__ == '__main__':
-    video_file = Path('output/final_video.mp4')
-    if video_file.exists():
-        try:
-            result = upload_to_instagram(str(video_file), "Test upload")
-            print(f"\nSuccess! Result: {result}")
-        except Exception as e:
-            print(f"\nFailed: {e}")
-    else:
-        print(f"Video not found: {video_file}")
+        print(f"[instagram] ❌ Error: {e}")
+        delete_github_temp_file(owner, repo, gh_token, remote_path, branch)
+        return {'status': 'failed', 'error': str(e), 'platform': 'instagram'}
