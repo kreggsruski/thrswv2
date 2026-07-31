@@ -25,7 +25,7 @@ IMAGE_HEIGHT = 1920 # Full HD height (9:16)
 
 STORY_MAX_WORDS = 130
 
-TOPICS_FILE = "topics.txt"
+TOPICS_FILE = Path("topics.txt")
 
 IMAGES_DIR = Path("images")
 OUTPUT_DIR = Path("output")
